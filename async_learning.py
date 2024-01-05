@@ -28,6 +28,7 @@ class Net(nn.Module):
         self.fc1 = nn.Linear(320, 50)
         self.fc2 = nn.Linear(50, 10)
 
+        # time tensor: [0] for timestamp, [1] for event number
         self.name_time = "time"
         self.event_number = 0
 
@@ -56,8 +57,8 @@ class Net(nn.Module):
     def win_update_weights(self, in_neighbors):
         dst_weights = {}
         for rank in in_neighbors:
-            last_weight_time = bf.win_update(name=self.name_time, self_weight=0.,
-                neighbor_weights={r: (0 if r != rank else 1) for r in in_neighbors})
+            last_weight_time = bf.win_update(name=self.name_time,
+                    self_weight=0., neighbor_weights={rank: 1})
             event_delta = self.event_number - last_weight_time[1]
             weight_time_delta = time.time() - last_weight_time[0] \
                               + (0 if event_delta < 0 else 2 * (event_delta))
@@ -90,22 +91,43 @@ test_loader = None
 FLAG = torch.FloatTensor([-1.])
 
 
+def wait_actual_neigh_weights(to_neighbors, from_neighbors, name_time):
+    actual_node_frac = 0.0
+    actual_node_needed_count = math.floor(
+        actual_node_frac * (1 + len(from_neighbors)))
+    wait_nodes = True
+    while wait_nodes:
+        ready_nodes_count = 0
+        for rank in from_neighbors:
+            last_weight_time = bf.win_update(name=name_time,
+                self_weight=0., neighbor_weights={rank: 1})
+            if model.event_number <= last_weight_time[1]:
+                ready_nodes_count += 1
+        #print(f"ready_nodes_count [{bf.rank()}]: {ready_nodes_count}/{actual_node_needed_count}")
+        #if ready_nodes_count > 0:
+        #    print(f"actual_node_needed_count: {bf.rank()} {actual_node_needed_count} {ready_nodes_count} {from_neighbors}")
+        if ready_nodes_count >= actual_node_needed_count:
+            wait_nodes = False
+
+
 def train(model, epoch, dynamic_neighbors, log_interval, name_flag):
     global FLAG
     model.train()
     train_sampler.set_epoch(epoch)
+    to_neighbors = bf.out_neighbor_ranks()
+    from_neighbors = bf.in_neighbor_ranks()
     for batch_idx, (data, target) in enumerate(train_loader):
-
         FLAG = bf.win_update(name=name_flag, reset=True)
+
         if bf.rank() == 0:
-        #    print(FLAG)
+            #print(FLAG)
             time.sleep(2)
         if FLAG > 0.0001:
             break
 
-        to_neighbors, from_neighbors = next(dynamic_neighbors)
-        #dst_weights = {rank: 1. / (len(from_neighbors) + 1) for rank in from_neighbors}
-        #self_weight = 1. / (len(from_neighbors) + 1)
+        #to_neighbors, from_neighbors = next(dynamic_neighbors)
+        #print(f"topo [ev {model.event_number}][{bf.rank()}]: in {from_neighbors}")
+        wait_actual_neigh_weights(to_neighbors, from_neighbors, model.name_time)
 
         optimizer.zero_grad()
         output = model(data)
@@ -209,8 +231,12 @@ if __name__=="__main__":
     bf.broadcast_parameters(model.state_dict(), root_rank=0)
     bf.broadcast_optimizer_state(optimizer, root_rank=0)
 
-    dynamic_neighbors = topology_util.GetDynamicSendRecvRanks(
-        bf.load_topology(), bf.rank())
+    #dynamic_neighbors = topology_util.GetDynamicSendRecvRanks(
+    #    bf.load_topology(), bf.rank())
+    #world_size, local_size = bf.size(), bf.local_size()
+    #print(f"world {world_size}, local {local_size}")
+    bf.set_topology(topology_util.FullyConnectedGraph(bf.size()))
+    dynamic_neighbors = None
     
     name_flag = "end"
     model.win_create_weights()
