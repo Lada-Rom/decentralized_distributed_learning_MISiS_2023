@@ -16,7 +16,10 @@
     "accum_initial_self_weight": 0.5,
 
     "log_interval": 10,
-    "log_topo": true,
+    "log_topo": false,
+    "log_weights_accum": false,
+    "log_ready_nodes": false,
+    "log_early_stop": false,
 
     "tensor_time_event_name": "time",
     "tensor_stop_train_name": "stop"

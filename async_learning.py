@@ -43,8 +43,11 @@ class ParamLoader:
         self.accum_func_params              = config_obj["accum_func_params"]
         self.accum_initial_self_weight      = config_obj["accum_initial_self_weight"]
         
-        self.log_interval   = config_obj["log_interval"]
-        self.log_topo       = config_obj["log_topo"]
+        self.log_interval       = config_obj["log_interval"]
+        self.log_topo           = config_obj["log_topo"]
+        self.log_weights_accum  = config_obj["log_weights_accum"]
+        self.log_ready_nodes    = config_obj["log_ready_nodes"]
+        self.log_early_stop     = config_obj["log_early_stop"]
 
         self.tensor_time_event_name = config_obj["tensor_time_event_name"]
         self.tensor_stop_train_name = config_obj["tensor_stop_train_name"]
@@ -134,13 +137,13 @@ class Topo:
                 bf.set_topology(topology_util.ExponentialGraph(bf.size()), params.topo_static_exp_base)
 
         if params.log_topo == True:
-            print(f"[{bf.rank()}]: in {bf.in_neighbor_ranks()}, out {bf.out_neighbor_ranks()}")
+            print(f"topo [{bf.rank()}]: in {bf.in_neighbor_ranks()}, out {bf.out_neighbor_ranks()}")
 
     def get_next_neights(self):
         if params.topo_enable_dynamic is True:
             to_ranks, from_ranks = next(self.dynamic_topo)
             if params.log_topo == True:
-                print(f"[{bf.rank()}]: in {from_ranks}, out {to_ranks}")
+                print(f"topo [{bf.rank()}]: in {from_ranks}, out {to_ranks}")
             return to_ranks, from_ranks
         else:
             return bf.out_neighbor_ranks(), bf.in_neighbor_ranks()
@@ -195,15 +198,17 @@ class Net(nn.Module):
                               + (0 if event_delta < 0 else 2 * (event_delta))
             exp = math.exp(-(weight_time_delta) / self.func_a + self.func_b) + self.func_c
             dst_weights[rank] = exp if exp > 0 else 0
-        #a = torch.randn(1)
-        #print(a, dst_weights)
         self_weight = self.self_weight
         norm = len(dst_weights.values())
         for rank, weight in dst_weights.items():
             dst_weights.update({rank: (1 - self_weight) * weight / (norm)})
         self_weight = 1 - sum(dst_weights.values())
-        #if self_weight > 0.5:
-        #print(dst_weights, self_weight, event_delta, weight_time_delta, last_weight_time[0])
+        
+        if params.log_weights_accum == True:
+            round_dst_weights = {r: round(x, 4) for (r, x) in dst_weights.items()}
+            print(f"weights: [{bf.rank()}]: self {round(self_weight, 4)}, "
+                  f"neigh {round_dst_weights}, "
+                  f"event delta {event_delta}, time delta {weight_time_delta}")
 
         for name, tensor in sorted(self.state_dict().items()):
             bf.win_update(name=name,
@@ -237,32 +242,29 @@ class NodeNetwork:
         self.stop_train = torch.FloatTensor([0.])
         bf.win_create(self.stop_train, name=self.name_stop_train, zero_init=True)
         bf.win_put(self.stop_train, name=self.name_stop_train)
-        #print("EPOCH", self.stop_train)
+        if params.log_early_stop == True:
+            print(f"stop [{bf.rank()}]: before train {self.stop_train}")
 
     def _prepare_to_test(self):
         self.stop_train = torch.FloatTensor([1.])
         bf.win_put(self.stop_train, name=self.name_stop_train)
-        #print(self.stop_train)
+        if params.log_early_stop == True:
+            print(f"stop [{bf.rank()}]: before test {self.stop_train}")
 
     def wait_actual_neigh_weights(self, to_neighbors, from_neighbors, name_time):
         actual_node_needed_count = math.floor(
             self.ready_nodes_frac * (1 + len(from_neighbors)))
         wait_nodes = True
         while wait_nodes:
-            ready_nodes_count = 0
+            ready_nodes = []
             for rank in from_neighbors:
                 last_weight_time = bf.win_update(name=name_time,
                     self_weight=0., neighbor_weights={rank: 1})
-                #if bf.rank() == 0:
-                #        print(self.model.event_number, last_weight_time[1])
                 if self.model.event_number <= last_weight_time[1]:
-                    ready_nodes_count += 1
-            #print(f"ready_nodes_count [{bf.rank()}]: {ready_nodes_count}/{actual_node_needed_count}")
-            #if ready_nodes_count > 0:
-            #    print(f"actual_node_needed_count: {bf.rank()} {actual_node_needed_count} {ready_nodes_count} {from_neighbors}")
-            #if bf.rank() == 0:
-            #    print("ready", ready_nodes_count, actual_node_needed_count)
-            if ready_nodes_count >= actual_node_needed_count:
+                    ready_nodes.append(rank)
+            if params.log_ready_nodes == True:
+                print(f"ready [{bf.rank()}]: {len(ready_nodes)} / {actual_node_needed_count}: {ready_nodes}")
+            if len(ready_nodes) >= actual_node_needed_count:
                 wait_nodes = False
 
     def train(self, dataset):
@@ -273,10 +275,9 @@ class NodeNetwork:
         for batch_idx, (data, target) in enumerate(dataset.train_loader):
             self.stop_train = bf.win_update(name=self.name_stop_train, reset=True)
 
-            if bf.rank() == 0:
-                #print(self.stop_train)
-                time.sleep(0.3)
             if self.stop_train > 0.0001:
+                if params.log_early_stop == True:
+                    print(f"stop [{bf.rank()}]: in train {self.stop_train}")
                 break
 
             to_neighbors, from_neighbors = self.topo.get_next_neights()
@@ -318,14 +319,14 @@ class NodeNetwork:
         test_loss /= len(dataset.test_sampler) if dataset.test_sampler else len(dataset.test_dataset)
         test_accuracy /= len(dataset.test_sampler) if dataset.test_sampler else len(dataset.test_dataset)
 
-        # Bluefog: average metric values across workers.
+        # bluefog: average metric values across workers.
         test_loss = self._metric_average(test_loss, "avg_loss")
         test_accuracy = self._metric_average(test_accuracy, "avg_accuracy")
 
         if bf.rank() == 0:
             print("\nTest set: Average loss: {:.4f}, Accuracy: {:.2f}%\n".format(
                 test_loss, 100.0 * test_accuracy), flush=True)
-        record.append((test_loss, 100.0 * test_accuracy))
+        record.append((round(test_loss, 4), round(100.0 * test_accuracy, 4)))
         bf.win_free(name=self.name_stop_train)
 
     def finish(self):
@@ -347,7 +348,9 @@ if __name__=="__main__":
         distr_network.test(data, test_record)
 
     distr_network.finish()
+    bf.barrier()
+
+    print("Rank: (Test loss, Test accuracy(%)), ...") if bf.rank() == 0 else time.sleep(0.01)
     print(f"[{bf.rank()}]: ", test_record)
 
-    bf.barrier()
     bf.win_free()
