@@ -1,0 +1,19 @@
+{
+    "train_batch_size": 64,
+    "test_batch_size": 1000,
+    "train_lr": 0.001,
+    "train_epochs": 10,
+
+    "topo_enable_dynamic": true,
+    "topo_static_kind": 0,
+
+    "accum_need_ready_neighs_frac": 0.0,
+    "accum_func_params": [10.0, 0.98, -1.7],
+    "accum_initial_self_weight": 0.5,
+
+    "log_interval": 10,
+    "log_topo": false,
+
+    "tensor_time_event_name": "time",
+    "tensor_stop_train_name": "stop"
+}

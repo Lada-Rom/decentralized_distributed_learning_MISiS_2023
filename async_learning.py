@@ -2,11 +2,14 @@ from __future__ import print_function
 
 from bluefog.common import topology_util
 import bluefog.torch as bf
+
 import os
 import sys
-import warnings
 import time
 import math
+import json
+
+import warnings
 warnings.simplefilter('ignore')
 
 import torch.nn as nn
@@ -19,8 +22,94 @@ sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..")))
 
 
+class ParamLoader:
+    def __init__(self, config_name):
+        with open(os.path.join(os.getcwd(), os.path.dirname(__file__), config_name)) as f:
+            config_obj = json.load(f)
+
+        self.train_batch_size   = config_obj["train_batch_size"]
+        self.test_batch_size    = config_obj["test_batch_size"]
+        self.train_lr           = config_obj["train_lr"]
+        self.train_epochs       = config_obj["train_epochs"]
+
+        self.topo_enable_dynamic    = config_obj["topo_enable_dynamic"]
+        self.topo_static_kind       = config_obj["topo_static_kind"]
+
+        self.accum_need_ready_neighs_frac   = config_obj["accum_need_ready_neighs_frac"]
+        self.accum_func_params              = config_obj["accum_func_params"]
+        self.accum_initial_self_weight      = config_obj["accum_initial_self_weight"]
+        
+        self.log_interval   = config_obj["log_interval"]
+        self.log_topo       = config_obj["log_topo"]
+
+        self.tensor_time_event_name = config_obj["tensor_time_event_name"]
+        self.tensor_stop_train_name = config_obj["tensor_stop_train_name"]
+
+
+class Dataset:
+    def __init__(self, params):
+        data_folder_loc = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..")
+        
+        # train dataset
+        self.train_dataset = datasets.MNIST(
+            os.path.join(data_folder_loc, "data", "data-%d" % bf.rank()),
+            train=True,
+            download=True,
+            transform=transforms.Compose(
+                [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+        )
+
+        self.train_sampler = torch.utils.data.distributed.DistributedSampler(
+            self.train_dataset, num_replicas=bf.size(), rank=bf.rank())
+        
+        self.train_loader = torch.utils.data.DataLoader(
+            self.train_dataset, batch_size=params.train_batch_size,
+            sampler=self.train_sampler, **{})
+
+        # test dataset
+        self.test_dataset = datasets.MNIST(
+            os.path.join(data_folder_loc, "data", "data-%d" % bf.rank()),
+            train=False,
+            transform=transforms.Compose(
+                [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+        )
+
+        self.test_sampler = None
+        self.test_sampler = torch.utils.data.distributed.DistributedSampler(
+            self.test_dataset, num_replicas=bf.size(), rank=bf.rank())
+        
+        self.test_loader = torch.utils.data.DataLoader(
+            self.test_dataset, batch_size=params.test_batch_size,
+            sampler=self.test_sampler, **{})
+
+
+class Topo:
+    def __init__(self, params):
+        self.dynamic_topo = None
+
+        if params.topo_enable_dynamic is True:
+            self.dynamic_topo = topology_util.\
+                GetDynamicSendRecvRanks(bf.load_topology(), bf.rank())
+        else:
+            # 0 = Fully Connected
+            # 1 = TODO
+            if params.topo_static_kind == 0:
+                bf.set_topology(topology_util.FullyConnectedGraph(bf.size()))
+
+    def get_next_neights(self):
+        if params.topo_enable_dynamic is True:
+            return next(self.dynamic_topo)
+        else:
+            return bf.out_neighbor_ranks(), bf.in_neighbor_ranks()
+
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, params):
+        self.func_a = params.accum_func_params[0]
+        self.func_b = params.accum_func_params[1]
+        self.func_c = params.accum_func_params[2]
+        self.self_weight = params.accum_initial_self_weight
+
         super(Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
         self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
@@ -29,7 +118,7 @@ class Net(nn.Module):
         self.fc2 = nn.Linear(50, 10)
 
         # time tensor: [0] for timestamp, [1] for event number
-        self.name_time = "time"
+        self.name_time = params.tensor_time_event_name
         self.event_number = 0
 
     def forward(self, x):
@@ -62,11 +151,11 @@ class Net(nn.Module):
             event_delta = self.event_number - last_weight_time[1]
             weight_time_delta = time.time() - last_weight_time[0] \
                               + (0 if event_delta < 0 else 2 * (event_delta))
-            exp = math.exp(-(weight_time_delta) / 10.0 + 0.98) - 1.7
+            exp = math.exp(-(weight_time_delta) / self.func_a + self.func_b) + self.func_c
             dst_weights[rank] = exp if exp > 0 else 0
         #a = torch.randn(1)
         #print(a, dst_weights)
-        self_weight = 0.5
+        self_weight = self.self_weight
         norm = len(dst_weights.values())
         for rank, weight in dst_weights.items():
             dst_weights.update({rank: (1 - self_weight) * weight / (norm)})
@@ -80,189 +169,142 @@ class Net(nn.Module):
             self.state_dict()[name].data[:] = tensor
 
 
-train_dataset = None
-train_sampler = None
-train_loader = None
+class NodeNetwork:
+    def __init__(self, params):
+        self.name_stop_train = params.tensor_stop_train_name
+        self.stop_train = torch.FloatTensor([-1.])
+        self.ready_nodes_frac = params.accum_need_ready_neighs_frac
 
-test_dataset = None
-test_sampler = None
-test_loader = None
+        self.model = Net(params)
+        self.optimizer = optim.SGD(self.model.parameters(), lr=params.train_lr * bf.size())
+        bf.broadcast_parameters(self.model.state_dict(), root_rank=0)
+        bf.broadcast_optimizer_state(self.optimizer, root_rank=0)
+        self.model.win_create_weights()
 
-FLAG = torch.FloatTensor([-1.])
+        self.topo = Topo(params)
 
+    def _metric_average(self, val, name):
+        tensor = torch.tensor(val)
+        avg_tensor = bf.allreduce(tensor, name=name)
+        return avg_tensor.item()
 
-def wait_actual_neigh_weights(to_neighbors, from_neighbors, name_time):
-    actual_node_frac = 0.0
-    actual_node_needed_count = math.floor(
-        actual_node_frac * (1 + len(from_neighbors)))
-    wait_nodes = True
-    while wait_nodes:
-        ready_nodes_count = 0
-        for rank in from_neighbors:
-            last_weight_time = bf.win_update(name=name_time,
-                self_weight=0., neighbor_weights={rank: 1})
-            if model.event_number <= last_weight_time[1]:
-                ready_nodes_count += 1
-        #print(f"ready_nodes_count [{bf.rank()}]: {ready_nodes_count}/{actual_node_needed_count}")
-        #if ready_nodes_count > 0:
-        #    print(f"actual_node_needed_count: {bf.rank()} {actual_node_needed_count} {ready_nodes_count} {from_neighbors}")
-        if ready_nodes_count >= actual_node_needed_count:
-            wait_nodes = False
+    def _prepare_to_train(self):
+        bf.barrier()
+        self.model.event_number = 0
 
+        self.stop_train = torch.FloatTensor([0.])
+        bf.win_create(self.stop_train, name=self.name_stop_train, zero_init=True)
+        bf.win_put(self.stop_train, name=self.name_stop_train)
+        #print("EPOCH", self.stop_train)
 
-def train(model, epoch, dynamic_neighbors, log_interval, name_flag):
-    global FLAG
-    model.train()
-    train_sampler.set_epoch(epoch)
-    to_neighbors = bf.out_neighbor_ranks()
-    from_neighbors = bf.in_neighbor_ranks()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        FLAG = bf.win_update(name=name_flag, reset=True)
+    def _prepare_to_test(self):
+        self.stop_train = torch.FloatTensor([1.])
+        bf.win_put(self.stop_train, name=self.name_stop_train)
+        #print(self.stop_train)
+
+    def wait_actual_neigh_weights(self, to_neighbors, from_neighbors, name_time):
+        actual_node_needed_count = math.floor(
+            self.ready_nodes_frac * (1 + len(from_neighbors)))
+        wait_nodes = True
+        while wait_nodes:
+            ready_nodes_count = 0
+            for rank in from_neighbors:
+                last_weight_time = bf.win_update(name=name_time,
+                    self_weight=0., neighbor_weights={rank: 1})
+                #if bf.rank() == 0:
+                #        print(self.model.event_number, last_weight_time[1])
+                if self.model.event_number <= last_weight_time[1]:
+                    ready_nodes_count += 1
+            #print(f"ready_nodes_count [{bf.rank()}]: {ready_nodes_count}/{actual_node_needed_count}")
+            #if ready_nodes_count > 0:
+            #    print(f"actual_node_needed_count: {bf.rank()} {actual_node_needed_count} {ready_nodes_count} {from_neighbors}")
+            #if bf.rank() == 0:
+            #    print("ready", ready_nodes_count, actual_node_needed_count)
+            if ready_nodes_count >= actual_node_needed_count:
+                wait_nodes = False
+
+    def train(self, dataset):
+        self._prepare_to_train()
+
+        self.model.train()
+        dataset.train_sampler.set_epoch(epoch)
+        for batch_idx, (data, target) in enumerate(dataset.train_loader):
+            self.stop_train = bf.win_update(name=self.name_stop_train, reset=True)
+
+            if bf.rank() == 0:
+                #print(self.stop_train)
+                time.sleep(0.3)
+            if self.stop_train > 0.0001:
+                break
+
+            to_neighbors, from_neighbors = self.topo.get_next_neights()
+            #print(f"topo [ev {model.event_number}][{bf.rank()}]: in {from_neighbors}")
+            self.wait_actual_neigh_weights(to_neighbors, from_neighbors, self.model.name_time)
+
+            self.optimizer.zero_grad()
+            output = self.model(data)
+            loss = F.nll_loss(output, target)
+            loss.backward()
+            self.optimizer.step()
+
+            self.model.win_put_weights()
+            self.model.win_update_weights(from_neighbors)
+
+            if batch_idx % params.log_interval == 0:
+                print("[{}] Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
+                        bf.rank(),
+                        epoch,
+                        batch_idx * len(data),
+                        len(dataset.train_sampler),
+                        100.0 * batch_idx / len(dataset.train_loader),
+                        loss.item()))
+
+    def test(self, dataset, record):
+        self._prepare_to_test()
+
+        self.model.eval()
+        test_loss = 0.0
+        test_accuracy = 0.0
+        for data, target in dataset.test_loader:
+            output = self.model(data)
+            # sum up batch loss
+            test_loss += F.nll_loss(output, target, size_average=False).item()
+            # get the index of the max log-probability
+            pred = output.data.max(1, keepdim=True)[1]
+            test_accuracy += pred.eq(target.data.view_as(pred)
+                                    ).cpu().float().sum().item()
+
+        test_loss /= len(dataset.test_sampler) if dataset.test_sampler else len(dataset.test_dataset)
+        test_accuracy /= len(dataset.test_sampler) if dataset.test_sampler else len(dataset.test_dataset)
+
+        # Bluefog: average metric values across workers.
+        test_loss = self._metric_average(test_loss, "avg_loss")
+        test_accuracy = self._metric_average(test_accuracy, "avg_accuracy")
 
         if bf.rank() == 0:
-            #print(FLAG)
-            time.sleep(2)
-        if FLAG > 0.0001:
-            break
+            print("\nTest set: Average loss: {:.4f}, Accuracy: {:.2f}%\n".format(
+                test_loss, 100.0 * test_accuracy), flush=True)
+        record.append((test_loss, 100.0 * test_accuracy))
+        bf.win_free(name=self.name_stop_train)
 
-        #to_neighbors, from_neighbors = next(dynamic_neighbors)
-        #print(f"topo [ev {model.event_number}][{bf.rank()}]: in {from_neighbors}")
-        wait_actual_neigh_weights(to_neighbors, from_neighbors, model.name_time)
-
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
-        optimizer.step()
-
-        model.win_put_weights()
-        model.win_update_weights(from_neighbors)
-
-        if batch_idx % log_interval == 0:
-            print("[{}] Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
-                    bf.rank(),
-                    epoch,
-                    batch_idx * len(data),
-                    len(train_sampler),
-                    100.0 * batch_idx / len(train_loader),
-                    loss.item()))
-
-
-def metric_average(val, name):
-    tensor = torch.tensor(val)
-    avg_tensor = bf.allreduce(tensor, name=name)
-    return avg_tensor.item()
-
-
-def test(model, record):
-    model.eval()
-    test_loss = 0.0
-    test_accuracy = 0.0
-    for data, target in test_loader:
-        output = model(data)
-        # sum up batch loss
-        test_loss += F.nll_loss(output, target, size_average=False).item()
-        # get the index of the max log-probability
-        pred = output.data.max(1, keepdim=True)[1]
-        test_accuracy += pred.eq(target.data.view_as(pred)
-                                 ).cpu().float().sum().item()
-
-    test_loss /= len(test_sampler) if test_sampler else len(test_dataset)
-    test_accuracy /= len(test_sampler) if test_sampler else len(test_dataset)
-
-    # Bluefog: average metric values across workers.
-    test_loss = metric_average(test_loss, "avg_loss")
-    test_accuracy = metric_average(test_accuracy, "avg_accuracy")
-
-    if bf.rank() == 0:
-        print("\nTest set: Average loss: {:.4f}, Accuracy: {:.2f}%\n".format(
-            test_loss, 100.0 * test_accuracy), flush=True)
-    record.append((test_loss, 100.0 * test_accuracy))
+    def finish(self):
+        self.model.win_put_weights()
+        self.model.win_update_weights(bf.in_neighbor_ranks())
 
 
 if __name__=="__main__":
     bf.init()
-    
-    batch_size = 64
-    test_batch_size = 1000
-    lr = 0.001
-    epochs = 10
-    log_interval = 10
 
-    data_folder_loc = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..")
-
-    # train dataset
-    train_dataset = datasets.MNIST(
-        os.path.join(data_folder_loc, "data", "data-%d" % bf.rank()),
-        train=True,
-        download=True,
-        transform=transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-        )
-    )
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=bf.size(), rank=bf.rank()
-    )
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, sampler=train_sampler, **{}
-    )
-
-    # test dataset
-    test_dataset = datasets.MNIST(
-        os.path.join(data_folder_loc, "data", "data-%d" % bf.rank()),
-        train=False,
-        transform=transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-        )
-    )
-    test_sampler = None
-    test_sampler = torch.utils.data.distributed.DistributedSampler(
-        test_dataset, num_replicas=bf.size(), rank=bf.rank()
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=test_batch_size, sampler=test_sampler, **{}
-    )
-
-    model = Net()
-    optimizer = optim.SGD(model.parameters(), lr=lr * bf.size())
-
-    # Bluefog: broadcast parameters & optimizer state.
-    bf.broadcast_parameters(model.state_dict(), root_rank=0)
-    bf.broadcast_optimizer_state(optimizer, root_rank=0)
-
-    #dynamic_neighbors = topology_util.GetDynamicSendRecvRanks(
-    #    bf.load_topology(), bf.rank())
-    #world_size, local_size = bf.size(), bf.local_size()
-    #print(f"world {world_size}, local {local_size}")
-    bf.set_topology(topology_util.FullyConnectedGraph(bf.size()))
-    dynamic_neighbors = None
-    
-    name_flag = "end"
-    model.win_create_weights()
+    params = ParamLoader("config.json")
+    data = Dataset(params)
+    distr_network = NodeNetwork(params)
 
     test_record = []
-    for epoch in range(1, epochs + 1):
-        bf.barrier()
-        model.event_number = 0
+    for epoch in range(1, params.train_epochs + 1):
+        distr_network.train(data)
+        distr_network.test(data, test_record)
 
-        FLAG = torch.FloatTensor([0.])
-        bf.win_create(FLAG, name=name_flag, zero_init=True)
-        bf.win_put(FLAG, name=name_flag)
-        #print("EPOCH", FLAG)
-
-        train(model, epoch, dynamic_neighbors, log_interval, name_flag)
-
-        FLAG = torch.FloatTensor([1.])
-        bf.win_put(FLAG, name=name_flag)
-        #print(FLAG)
-
-        test(model, test_record)
-        bf.win_free(name=name_flag)
-
-    model.win_put_weights()
-    model.win_update_weights(bf.in_neighbor_ranks())
-
+    distr_network.finish()
     print(f"[{bf.rank()}]: ", test_record)
 
     bf.barrier()
