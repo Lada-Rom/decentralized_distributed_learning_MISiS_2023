@@ -4,15 +4,19 @@
     "train_lr": 0.001,
     "train_epochs": 10,
 
-    "topo_enable_dynamic": true,
+    "topo_enable_dynamic": false,
     "topo_static_kind": 0,
+    "topo_static_ring_direction": 0,
+    "topo_static_star_center": 0,
+    "topo_static_meshgrid_size": [0, 0],
+    "topo_static_exp_base": 4,
 
     "accum_need_ready_neighs_frac": 0.0,
     "accum_func_params": [10.0, 0.98, -1.7],
     "accum_initial_self_weight": 0.5,
 
     "log_interval": 10,
-    "log_topo": false,
+    "log_topo": true,
 
     "tensor_time_event_name": "time",
     "tensor_stop_train_name": "stop"

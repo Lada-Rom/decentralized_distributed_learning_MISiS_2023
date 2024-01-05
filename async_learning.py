@@ -32,8 +32,12 @@ class ParamLoader:
         self.train_lr           = config_obj["train_lr"]
         self.train_epochs       = config_obj["train_epochs"]
 
-        self.topo_enable_dynamic    = config_obj["topo_enable_dynamic"]
-        self.topo_static_kind       = config_obj["topo_static_kind"]
+        self.topo_enable_dynamic        = config_obj["topo_enable_dynamic"]
+        self.topo_static_kind           = config_obj["topo_static_kind"]
+        self.topo_static_ring_direction = config_obj["topo_static_ring_direction"]
+        self.topo_static_star_center    = config_obj["topo_static_star_center"]
+        self.topo_static_meshgrid_size  = (config_obj["topo_static_meshgrid_size"][0], config_obj["topo_static_meshgrid_size"][1])
+        self.topo_static_exp_base       = config_obj["topo_static_exp_base"]
 
         self.accum_need_ready_neighs_frac   = config_obj["accum_need_ready_neighs_frac"]
         self.accum_func_params              = config_obj["accum_func_params"]
@@ -89,17 +93,55 @@ class Topo:
         self.dynamic_topo = None
 
         if params.topo_enable_dynamic is True:
+            print("Dynamic topology setted.")
             self.dynamic_topo = topology_util.\
                 GetDynamicSendRecvRanks(bf.load_topology(), bf.rank())
         else:
             # 0 = Fully Connected
-            # 1 = TODO
+            # 1 = Ring (0 - bi, 1 - left, 2 - right)
+            # 2 = Star (center)
+            # 3 = MeshGrid (default bf size on [0,0] input tuple)
+            # 4 = SymmetricExponentialGraph (base)
+            # 5 = ExponentialGraph (base)
             if params.topo_static_kind == 0:
+                if bf.rank() == 0:
+                    print("Static topology: FullyConnectedGraph.")
                 bf.set_topology(topology_util.FullyConnectedGraph(bf.size()))
+            elif params.topo_static_kind == 1:
+                if bf.rank() == 0:
+                    print(f"Static topology: RingGraph (direction {params.topo_static_ring_direction}).")
+                bf.set_topology(topology_util.RingGraph(bf.size()), params.topo_static_ring_direction)
+            elif params.topo_static_kind == 2:
+                if bf.rank() == 0:
+                    print(f"Static topology: StarGraph (center on {params.topo_static_star_center} rank).")
+                bf.set_topology(topology_util.StarGraph(bf.size()), params.topo_static_star_center)
+            elif params.topo_static_kind == 3:
+                if params.topo_static_meshgrid_size == (0, 0):
+                    if bf.rank() == 0:
+                        print(f"Static topology: MeshGrid2DGraph.")
+                    bf.set_topology(topology_util.MeshGrid2DGraph(bf.size()))
+                else:
+                    if bf.rank() == 0:
+                        print(f"Static topology: MeshGrid2DGraph (size {params.topo_static_meshgrid_size}).")
+                    bf.set_topology(topology_util.MeshGrid2DGraph(bf.size()), params.topo_static_meshgrid_size)
+            elif params.topo_static_kind == 4:
+                if bf.rank() == 0:
+                    print(f"Static topology: SymmetricExponentialGraph (base {params.topo_static_exp_base}).")
+                bf.set_topology(topology_util.SymmetricExponentialGraph(bf.size()), params.topo_static_exp_base)
+            elif params.topo_static_kind == 5:
+                if bf.rank() == 0:
+                    print(f"Static topology: ExponentialGraph (base {params.topo_static_exp_base}).")
+                bf.set_topology(topology_util.ExponentialGraph(bf.size()), params.topo_static_exp_base)
+
+        if params.log_topo == True:
+            print(f"[{bf.rank()}]: in {bf.in_neighbor_ranks()}, out {bf.out_neighbor_ranks()}")
 
     def get_next_neights(self):
         if params.topo_enable_dynamic is True:
-            return next(self.dynamic_topo)
+            to_ranks, from_ranks = next(self.dynamic_topo)
+            if params.log_topo == True:
+                print(f"[{bf.rank()}]: in {from_ranks}, out {to_ranks}")
+            return to_ranks, from_ranks
         else:
             return bf.out_neighbor_ranks(), bf.in_neighbor_ranks()
 
@@ -179,9 +221,9 @@ class NodeNetwork:
         self.optimizer = optim.SGD(self.model.parameters(), lr=params.train_lr * bf.size())
         bf.broadcast_parameters(self.model.state_dict(), root_rank=0)
         bf.broadcast_optimizer_state(self.optimizer, root_rank=0)
-        self.model.win_create_weights()
-
+        
         self.topo = Topo(params)
+        self.model.win_create_weights()
 
     def _metric_average(self, val, name):
         tensor = torch.tensor(val)
@@ -238,7 +280,6 @@ class NodeNetwork:
                 break
 
             to_neighbors, from_neighbors = self.topo.get_next_neights()
-            #print(f"topo [ev {model.event_number}][{bf.rank()}]: in {from_neighbors}")
             self.wait_actual_neigh_weights(to_neighbors, from_neighbors, self.model.name_time)
 
             self.optimizer.zero_grad()
@@ -294,6 +335,7 @@ class NodeNetwork:
 
 if __name__=="__main__":
     bf.init()
+    bf.win_free()
 
     params = ParamLoader("config.json")
     data = Dataset(params)
