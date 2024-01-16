@@ -332,15 +332,14 @@ class NodeNetwork:
         # bluefog: average metric values across workers.
         test_loss = self._metric_average(test_loss, "avg_loss")
         test_accuracy = self._metric_average(test_accuracy, "avg_accuracy")
+        epoch_time = self._metric_average(time.time() - time_record[-1], "avg_time")
 
         test_record.append((round(test_loss, 4), round(100.0 * test_accuracy, 4)))
-        time_record[-1] = round(time.time() - time_record[-1], 4)
+        time_record[-1] = round(epoch_time, 4)
         if bf.rank() == 0:
             print("\nTest set: Average loss: {:.4f}, Accuracy: {:.2f}%".format(
                 test_loss, 100.0 * test_accuracy), flush=True)
-        else:
-            time.sleep(0.001)
-        print(f"Epoch time on rank [{bf.rank()}]: {time_record[-1]} sec")
+            print(f"Epoch time: {time_record[-1]} sec\n")
         bf.win_free(name=self.name_stop_train)
 
     def finish(self):
