@@ -2,10 +2,10 @@
     "train_batch_size": 64,
     "test_batch_size": 1000,
     "train_lr": 0.001,
-    "train_epochs": 10,
+    "train_epochs": 3,
 
-    "topo_enable_dynamic": false,
-    "topo_static_kind": 0,
+    "topo_enable_dynamic": true,
+    "topo_static_kind": 1,
     "topo_static_ring_direction": 0,
     "topo_static_star_center": 0,
     "topo_static_meshgrid_size": [0, 0],
@@ -15,7 +15,7 @@
     "accum_func_params": [10.0, 0.98, -1.7],
     "accum_initial_self_weight": 0.5,
 
-    "log_interval": 10,
+    "log_interval": 1,
     "log_topo": false,
     "log_weights_accum": false,
     "log_ready_nodes": false,
