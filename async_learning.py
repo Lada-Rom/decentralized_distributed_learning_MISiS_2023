@@ -110,9 +110,9 @@ class Topo:
             else:
                 print(f"Static topology: MeshGrid2DGraph (size {params.topo_static_meshgrid_size}).")
         elif params.topo_static_kind == 4:
-            print(f"Static topology: SymmetricExponentialGraph (base {params.topo_static_exp_base}).")
-        elif params.topo_static_kind == 5:
             print(f"Static topology: ExponentialGraph (base {params.topo_static_exp_base}).")
+        elif params.topo_static_kind == 5:
+            print(f"Static topology: SymmetricExponentialGraph (base {params.topo_static_exp_base}).")
 
     def __init__(self, params):
         self.dynamic_topo = None
@@ -125,8 +125,8 @@ class Topo:
             # 1 = Ring (0 - bi, 1 - left, 2 - right)
             # 2 = Star (center)
             # 3 = MeshGrid (default bf size on [0,0] input tuple)
-            # 4 = SymmetricExponentialGraph (base)
-            # 5 = ExponentialGraph (base)
+            # 4 = ExponentialGraph (base)
+            # 5 = SymmetricExponentialGraph (base)
             if params.topo_static_kind == 0:
                 bf.set_topology(topology_util.FullyConnectedGraph(bf.size()))
             elif params.topo_static_kind == 1:
@@ -139,9 +139,10 @@ class Topo:
                 else:
                     bf.set_topology(topology_util.MeshGrid2DGraph(bf.size()), params.topo_static_meshgrid_size)
             elif params.topo_static_kind == 4:
-                bf.set_topology(topology_util.SymmetricExponentialGraph(bf.size()), params.topo_static_exp_base)
-            elif params.topo_static_kind == 5:
                 bf.set_topology(topology_util.ExponentialGraph(bf.size()), params.topo_static_exp_base)
+            elif params.topo_static_kind == 5:
+                bf.set_topology(topology_util.SymmetricExponentialGraph(bf.size()), params.topo_static_exp_base)
+
 
         self.log_topo_type(params)
         if params.log_topo == True:
@@ -207,10 +208,11 @@ class Net(nn.Module):
             exp = math.exp(-(weight_time_delta) / self.func_a + self.func_b) + self.func_c
             dst_weights[rank] = exp if exp > 0 else 0
         self_weight = self.self_weight
-        norm = len(dst_weights.values())
-        for rank, weight in dst_weights.items():
-            dst_weights.update({rank: (1 - self_weight) * weight / (norm)})
-        self_weight = 1 - sum(dst_weights.values())
+        norm = sum(dst_weights.values())
+        if norm > 0:
+            for rank, weight in dst_weights.items():
+                dst_weights.update({rank: (1 - self_weight) * weight / (norm)})
+        self_weight = 1.0 - sum(dst_weights.values())
 
         if params.log_weights_accum == True:
             round_dst_weights = {r: round(x, 4) for (r, x) in dst_weights.items()}
